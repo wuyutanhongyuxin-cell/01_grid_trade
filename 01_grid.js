@@ -1,5 +1,614 @@
-// 01交易所 BTC 网格自动下单系统 - 带风控冷却机制
+// 01交易所 BTC 网格自动下单系统 - 带风控冷却机制 + 插针狙击
 // 基于原版 var_grid.js 改写，适配 01.xyz 交易所
+// v2.0 - 整合大单监控与插针狙击策略
+
+// ==================== 大单监控模块 ====================
+class WhaleMonitor {
+    // 监控配置（基于234分钟数据分析优化）
+    static CONFIG = {
+        checkInterval: 1000,          // 检查间隔 1秒
+        whaleThreshold: 50000,        // 大单阈值 $50k USDC
+        spikeThreshold: 60,           // 插针阈值 $60（从$80优化）
+
+        // 真空检测参数
+        vacuumRange: 150,             // 检测范围 ±$150
+        vacuumMinWhales: 3,           // 少于3个大单视为真空
+
+        // 撤单速度监控
+        velocityWindow: 10000,        // 速度计算窗口 10秒
+        highRemovalVelocity: 3,       // 高撤单速度阈值 3次/秒
+
+        // 订单簿不平衡参数
+        imbalanceWarning: 0.4,
+        imbalanceCritical: 0.6,
+
+        // V型反转检测
+        vShapeWindow: 30000,          // V型反转检测窗口 30秒
+        minDownSpikeSize: 150,        // DOWN至少 $150
+
+        // 标志性订单规模（做市商特征）
+        signatureSize1: 53600,        // 做市商标准小单
+        signatureSize2: 93000,        // 1 BTC 订单
+        signatureTolerance: 500,
+    };
+
+    // 狙击策略配置
+    static SNIPER_CONFIG = {
+        // DOWN_SPIKE 做多策略（最可靠）
+        LONG_AFTER_DOWN: {
+            enabled: true,
+            minSpikeSize: 100,        // 最小插针幅度 $100
+            stopLoss: 60,             // 止损 $60
+            takeProfit: [80, 120],    // 分批止盈
+            trailingStop: 40,         // 移动止损 $40
+            maxHoldTime: 300000,      // 最大持仓 5分钟
+            confirmVacuum: true,
+        },
+
+        // V型反转策略
+        V_SHAPE_REVERSAL: {
+            enabled: true,
+            maxInterval: 30000,       // 两次插针间隔 ≤30秒
+            minDownSize: 150,
+            stopLoss: 40,
+            takeProfit: [100, 150],
+        }
+    };
+
+    constructor() {
+        this.isRunning = false;
+        this.whaleOrders = new Map();
+        this.priceHistory = [];
+        this.logs = [];
+        this.spikeEvents = [];
+
+        // 监控指标
+        this.metrics = {
+            vacuumDetected: false,
+            vacuumStartTime: null,
+            removalVelocity: 0,
+            imbalanceRatio: 0,
+            priceVelocity: 0,
+            lastSpike: null,
+        };
+
+        // 统计
+        this.stats = {
+            totalNewOrders: 0,
+            totalRemovedOrders: 0,
+            upSpikes: 0,
+            downSpikes: 0,
+            signalsGenerated: 0,
+        };
+
+        // 警报级别
+        this.alertLevel = 'GREEN';
+
+        // 信号队列（供主交易系统使用）
+        this.pendingSignals = [];
+    }
+
+    // ========== 订单簿抓取（复用01.xyz的DOM结构）==========
+    getOrderBookData() {
+        const whales = { asks: [], bids: [] };
+
+        try {
+            // 卖单（红色/pink）
+            const askRows = document.querySelectorAll('div[class*="text-01-pink"][class*="z-20"]');
+            askRows.forEach(el => {
+                const priceText = el.textContent?.trim();
+                const price = parseFloat(priceText?.replace(/,/g, ''));
+                if (!price || price < 80000 || price > 150000) return;
+
+                const row = el.closest('[class*="grid"]');
+                if (!row) return;
+
+                const spans = row.querySelectorAll('div[class*="z-20"], span');
+                let sizeUSDC = null;
+
+                spans.forEach(span => {
+                    const text = span.textContent?.trim()?.replace(/,/g, '');
+                    const num = parseFloat(text);
+                    if (num >= WhaleMonitor.CONFIG.whaleThreshold && num < 1000000) {
+                        sizeUSDC = num;
+                    }
+                });
+
+                if (sizeUSDC) {
+                    whales.asks.push({ price, sizeUSDC, side: 'ask' });
+                }
+            });
+
+            // 买单（绿色/green）
+            const bidRows = document.querySelectorAll('div[class*="text-01-green"][class*="z-20"]');
+            bidRows.forEach(el => {
+                const priceText = el.textContent?.trim();
+                const price = parseFloat(priceText?.replace(/,/g, ''));
+                if (!price || price < 80000 || price > 150000) return;
+
+                const row = el.closest('[class*="grid"]');
+                if (!row) return;
+
+                const spans = row.querySelectorAll('div[class*="z-20"], span');
+                let sizeUSDC = null;
+
+                spans.forEach(span => {
+                    const text = span.textContent?.trim()?.replace(/,/g, '');
+                    const num = parseFloat(text);
+                    if (num >= WhaleMonitor.CONFIG.whaleThreshold && num < 1000000) {
+                        sizeUSDC = num;
+                    }
+                });
+
+                if (sizeUSDC) {
+                    whales.bids.push({ price, sizeUSDC, side: 'bid' });
+                }
+            });
+        } catch (e) {
+            // 静默失败
+        }
+
+        return whales;
+    }
+
+    getCurrentMidPrice() {
+        try {
+            const priceSpans = document.querySelectorAll('span.text-base.number');
+            let askPrice = null, bidPrice = null;
+
+            priceSpans.forEach(span => {
+                const text = span.textContent.trim();
+                if (text.startsWith('$')) {
+                    const price = parseFloat(text.replace(/[$,]/g, ''));
+                    if (price > 80000 && price < 150000) {
+                        if (!askPrice) askPrice = price;
+                        else if (!bidPrice) bidPrice = price;
+                    }
+                }
+            });
+
+            if (askPrice && bidPrice) {
+                if (askPrice < bidPrice) [askPrice, bidPrice] = [bidPrice, askPrice];
+                return (askPrice + bidPrice) / 2;
+            }
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // ========== 核心监控逻辑 ==========
+    tick() {
+        const orderbook = this.getOrderBookData();
+        const currentPrice = this.getCurrentMidPrice();
+        if (!currentPrice) return null;
+
+        // 1. 更新价格历史
+        this.updatePriceHistory(currentPrice);
+
+        // 2. 检测大单变化
+        this.detectWhaleChanges(orderbook, currentPrice);
+
+        // 3. 更新各项指标
+        this.updateMetrics(orderbook, currentPrice);
+
+        // 4. 评估风险等级
+        this.evaluateRisk();
+
+        // 5. 检测插针
+        const spike = this.detectSpike(currentPrice);
+        if (spike) {
+            this.handleSpike(spike, orderbook);
+        }
+
+        // 6. 检测V型反转
+        this.detectVShapeReversal();
+
+        return {
+            price: currentPrice,
+            alertLevel: this.alertLevel,
+            metrics: { ...this.metrics },
+            hasPendingSignal: this.pendingSignals.length > 0
+        };
+    }
+
+    updatePriceHistory(currentPrice) {
+        this.priceHistory.push({
+            time: Date.now(),
+            price: currentPrice
+        });
+
+        // 保留最近60秒数据
+        const cutoff = Date.now() - 60000;
+        this.priceHistory = this.priceHistory.filter(p => p.time > cutoff);
+    }
+
+    detectWhaleChanges(orderbook, currentPrice) {
+        const currentWhales = new Map();
+        const allOrders = [...orderbook.asks, ...orderbook.bids];
+
+        allOrders.forEach(order => {
+            const key = `${order.side}_${order.price}`;
+            currentWhales.set(key, order);
+        });
+
+        // 检测新增大单
+        currentWhales.forEach((order, key) => {
+            if (!this.whaleOrders.has(key)) {
+                this.stats.totalNewOrders++;
+                this.logs.push({
+                    timestamp: new Date().toISOString(),
+                    action: 'NEW_WHALE_ORDER',
+                    side: order.side,
+                    order: { ...order }
+                });
+
+                // 检测标志性订单
+                const cfg = WhaleMonitor.CONFIG;
+                const isSignature = Math.abs(order.sizeUSDC - cfg.signatureSize1) < cfg.signatureTolerance ||
+                                   Math.abs(order.sizeUSDC - cfg.signatureSize2) < cfg.signatureTolerance;
+                if (isSignature) {
+                    console.log(`%c🐋 标志性大单: ${order.side.toUpperCase()} $${order.price.toFixed(1)} | $${order.sizeUSDC.toLocaleString()}`,
+                        'color: #FF9800;');
+                }
+            }
+        });
+
+        // 检测撤销大单
+        this.whaleOrders.forEach((order, key) => {
+            if (!currentWhales.has(key)) {
+                this.stats.totalRemovedOrders++;
+                this.logs.push({
+                    timestamp: new Date().toISOString(),
+                    action: 'WHALE_ORDER_REMOVED',
+                    side: order.side,
+                    order: { ...order },
+                    currentPrice
+                });
+            }
+        });
+
+        this.whaleOrders = currentWhales;
+
+        // 限制日志数量
+        if (this.logs.length > 2000) this.logs = this.logs.slice(-2000);
+    }
+
+    updateMetrics(orderbook, currentPrice) {
+        // 1. 真空检测
+        this.detectVacuum(orderbook, currentPrice);
+
+        // 2. 撤单速度
+        this.calculateRemovalVelocity();
+
+        // 3. 订单簿不平衡度
+        this.calculateImbalance(orderbook);
+
+        // 4. 价格速度
+        this.calculatePriceVelocity();
+    }
+
+    detectVacuum(orderbook, currentPrice) {
+        const range = WhaleMonitor.CONFIG.vacuumRange;
+        const minWhales = WhaleMonitor.CONFIG.vacuumMinWhales;
+
+        const nearbyAsks = orderbook.asks.filter(o =>
+            o.price <= currentPrice + range && o.price >= currentPrice
+        );
+        const nearbyBids = orderbook.bids.filter(o =>
+            o.price >= currentPrice - range && o.price <= currentPrice
+        );
+
+        const totalNearby = nearbyAsks.length + nearbyBids.length;
+
+        if (totalNearby < minWhales) {
+            if (!this.metrics.vacuumDetected) {
+                this.metrics.vacuumDetected = true;
+                this.metrics.vacuumStartTime = Date.now();
+                console.log('%c⚠️ 订单簿真空检测! 附近大单仅 ' + totalNearby + ' 个',
+                    'color: #FF5722; font-weight: bold; font-size: 14px;');
+            }
+        } else {
+            if (this.metrics.vacuumDetected) {
+                const duration = (Date.now() - this.metrics.vacuumStartTime) / 1000;
+                console.log(`%c✅ 真空结束，持续 ${duration.toFixed(1)} 秒`, 'color: #4CAF50;');
+            }
+            this.metrics.vacuumDetected = false;
+            this.metrics.vacuumStartTime = null;
+        }
+    }
+
+    calculateRemovalVelocity() {
+        const window = WhaleMonitor.CONFIG.velocityWindow;
+        const cutoff = Date.now() - window;
+
+        const recentRemovals = this.logs.filter(l =>
+            l.action === 'WHALE_ORDER_REMOVED' &&
+            new Date(l.timestamp).getTime() > cutoff
+        );
+
+        this.metrics.removalVelocity = recentRemovals.length / (window / 1000);
+
+        if (this.metrics.removalVelocity > WhaleMonitor.CONFIG.highRemovalVelocity) {
+            console.log(`%c⚠️ 高撤单速度: ${this.metrics.removalVelocity.toFixed(1)}/秒`,
+                'color: #FF9800;');
+        }
+    }
+
+    calculateImbalance(orderbook) {
+        const bidVolume = orderbook.bids.reduce((sum, o) => sum + o.sizeUSDC, 0);
+        const askVolume = orderbook.asks.reduce((sum, o) => sum + o.sizeUSDC, 0);
+        this.metrics.imbalanceRatio = (bidVolume - askVolume) / (bidVolume + askVolume + 1);
+    }
+
+    calculatePriceVelocity() {
+        if (this.priceHistory.length < 2) {
+            this.metrics.priceVelocity = 0;
+            return;
+        }
+
+        const recent = this.priceHistory.slice(-10);
+        const oldest = recent[0];
+        const newest = recent[recent.length - 1];
+
+        const timeDiff = (newest.time - oldest.time) / 1000;
+        const priceDiff = newest.price - oldest.price;
+
+        this.metrics.priceVelocity = timeDiff > 0 ? priceDiff / timeDiff : 0;
+    }
+
+    // ========== 风险评估 ==========
+    evaluateRisk() {
+        let riskScore = 0;
+
+        if (this.metrics.vacuumDetected) riskScore += 3;
+        if (this.metrics.removalVelocity > WhaleMonitor.CONFIG.highRemovalVelocity) riskScore += 2;
+        if (Math.abs(this.metrics.imbalanceRatio) > WhaleMonitor.CONFIG.imbalanceCritical) riskScore += 2;
+        else if (Math.abs(this.metrics.imbalanceRatio) > WhaleMonitor.CONFIG.imbalanceWarning) riskScore += 1;
+        if (Math.abs(this.metrics.priceVelocity) > 20) riskScore += 2;
+
+        let newLevel;
+        if (riskScore >= 6) newLevel = 'RED';
+        else if (riskScore >= 4) newLevel = 'ORANGE';
+        else if (riskScore >= 2) newLevel = 'YELLOW';
+        else newLevel = 'GREEN';
+
+        if (newLevel !== this.alertLevel) {
+            this.setAlertLevel(newLevel, riskScore);
+        }
+        this.alertLevel = newLevel;
+    }
+
+    setAlertLevel(level, score) {
+        const colors = {
+            GREEN: '#4CAF50',
+            YELLOW: '#FFC107',
+            ORANGE: '#FF9800',
+            RED: '#F44336'
+        };
+        const messages = {
+            GREEN: '市场正常',
+            YELLOW: '注意观察',
+            ORANGE: '高风险状态',
+            RED: '⚠️ 即将插针！准备入场'
+        };
+
+        console.log(
+            `%c[${level}] ${messages[level]} (风险分: ${score})`,
+            `color: ${colors[level]}; font-weight: bold; font-size: 14px;`
+        );
+
+        if (level === 'RED' && 'Notification' in window && Notification.permission === 'granted') {
+            new Notification('01.xyz 插针警报!', { body: messages[level] });
+        }
+    }
+
+    // ========== 插针检测 ==========
+    detectSpike(currentPrice) {
+        if (this.priceHistory.length < 3) return null;
+
+        // 方法1: 检测短期剧烈波动（3-5秒内）
+        const recentHistory = this.priceHistory.filter(p =>
+            Date.now() - p.time >= 2000 && Date.now() - p.time <= 6000
+        );
+
+        // 方法2: 检测中期波动（5-15秒内）
+        const midHistory = this.priceHistory.filter(p =>
+            Date.now() - p.time >= 5000 && Date.now() - p.time <= 15000
+        );
+
+        const threshold = WhaleMonitor.CONFIG.spikeThreshold;
+        let spike = null;
+
+        // 优先检测短期剧烈波动
+        if (recentHistory.length > 0) {
+            const oldPrice = recentHistory[0].price;
+            const change = currentPrice - oldPrice;
+
+            if (Math.abs(change) >= threshold) {
+                spike = {
+                    type: change > 0 ? 'UP_SPIKE' : 'DOWN_SPIKE',
+                    fromPrice: oldPrice,
+                    toPrice: currentPrice,
+                    change,
+                    duration: Date.now() - recentHistory[0].time,
+                    time: new Date().toISOString()
+                };
+            }
+        }
+
+        // 如果短期没检测到，检测中期
+        if (!spike && midHistory.length > 0) {
+            const oldPrice = midHistory[0].price;
+            const change = currentPrice - oldPrice;
+
+            // 中期波动需要更大的阈值
+            if (Math.abs(change) >= threshold * 1.5) {
+                spike = {
+                    type: change > 0 ? 'UP_SPIKE' : 'DOWN_SPIKE',
+                    fromPrice: oldPrice,
+                    toPrice: currentPrice,
+                    change,
+                    duration: Date.now() - midHistory[0].time,
+                    time: new Date().toISOString()
+                };
+            }
+        }
+
+        return spike;
+    }
+
+    handleSpike(spike, orderbook) {
+        const lastSpike = this.metrics.lastSpike;
+        if (lastSpike && Date.now() - new Date(lastSpike.time).getTime() < 5000) return;
+
+        this.metrics.lastSpike = spike;
+
+        if (spike.type === 'UP_SPIKE') this.stats.upSpikes++;
+        else this.stats.downSpikes++;
+
+        spike.nearbyWhales = {
+            asks: orderbook.asks.filter(o => Math.abs(o.price - spike.toPrice) < 300),
+            bids: orderbook.bids.filter(o => Math.abs(o.price - spike.toPrice) < 300)
+        };
+
+        this.spikeEvents.push(spike);
+        if (this.spikeEvents.length > 100) this.spikeEvents = this.spikeEvents.slice(-100);
+
+        const color = spike.type === 'UP_SPIKE' ? '#4CAF50' : '#F44336';
+        const arrow = spike.type === 'UP_SPIKE' ? '📈' : '📉';
+
+        console.log(
+            `%c${arrow} ${spike.type}: $${spike.fromPrice.toFixed(1)} → $${spike.toPrice.toFixed(1)} (${spike.change > 0 ? '+' : ''}${spike.change.toFixed(1)})`,
+            `color: ${color}; font-weight: bold; font-size: 16px;`
+        );
+
+        // 检查入场信号
+        this.checkEntrySignal(spike);
+    }
+
+    detectVShapeReversal() {
+        const config = WhaleMonitor.SNIPER_CONFIG.V_SHAPE_REVERSAL;
+        if (!config.enabled) return;
+
+        const recentSpikes = this.spikeEvents.filter(s =>
+            Date.now() - new Date(s.time).getTime() < config.maxInterval
+        );
+
+        if (recentSpikes.length < 2) return;
+
+        const last = recentSpikes[recentSpikes.length - 1];
+        const prev = recentSpikes[recentSpikes.length - 2];
+
+        if (prev.type === 'DOWN_SPIKE' && last.type === 'UP_SPIKE') {
+            const interval = new Date(last.time) - new Date(prev.time);
+
+            if (interval <= config.maxInterval && Math.abs(prev.change) >= config.minDownSize) {
+                console.log(
+                    '%c🔄 V型反转确认! DOWN(-$' + Math.abs(prev.change).toFixed(0) +
+                    ') → UP(+$' + last.change.toFixed(0) + ') 间隔' + (interval/1000).toFixed(1) + '秒',
+                    'color: #9C27B0; font-weight: bold; font-size: 14px;'
+                );
+
+                this.generateSignal({
+                    type: 'V_SHAPE_LONG',
+                    confidence: 0.9,
+                    entryPrice: last.toPrice,
+                    stopLoss: config.stopLoss,
+                    takeProfit: config.takeProfit,
+                    reason: 'V型反转'
+                });
+            }
+        }
+    }
+
+    checkEntrySignal(spike) {
+        if (spike.type === 'DOWN_SPIKE') {
+            const config = WhaleMonitor.SNIPER_CONFIG.LONG_AFTER_DOWN;
+            if (!config.enabled) return;
+            if (Math.abs(spike.change) < config.minSpikeSize) return;
+
+            if (config.confirmVacuum && !this.metrics.vacuumDetected) {
+                if (Math.abs(spike.change) < 150) return;
+            }
+
+            // 生成做多信号
+            this.generateSignal({
+                type: 'LONG_AFTER_DOWN',
+                confidence: this.metrics.vacuumDetected ? 0.9 : 0.7,
+                entryPrice: spike.toPrice,
+                stopLoss: config.stopLoss,
+                takeProfit: config.takeProfit,
+                trailingStop: config.trailingStop,
+                maxHoldTime: config.maxHoldTime,
+                reason: `DOWN_SPIKE做多 (跌幅: $${Math.abs(spike.change).toFixed(0)})`
+            });
+        }
+    }
+
+    generateSignal(signal) {
+        if (signal.confidence < 0.7) return;
+
+        this.stats.signalsGenerated++;
+        this.pendingSignals.push({
+            ...signal,
+            timestamp: Date.now()
+        });
+
+        // 限制信号队列长度
+        if (this.pendingSignals.length > 10) {
+            this.pendingSignals = this.pendingSignals.slice(-10);
+        }
+
+        console.log('%c═══════════════════════════════════════════', 'color: #9C27B0;');
+        console.log('%c  🎯 入场信号生成', 'color: #9C27B0; font-weight: bold; font-size: 16px;');
+        console.log('%c═══════════════════════════════════════════', 'color: #9C27B0;');
+        console.log(`  类型: ${signal.type}`);
+        console.log(`  入场价: $${signal.entryPrice.toFixed(1)}`);
+        console.log(`  止损: $${signal.stopLoss}`);
+        console.log(`  止盈: $${signal.takeProfit.join(' / $')}`);
+        console.log(`  置信度: ${(signal.confidence * 100).toFixed(0)}%`);
+        console.log(`  原因: ${signal.reason}`);
+    }
+
+    // ========== 获取待处理信号 ==========
+    getPendingSignal() {
+        // 返回最新的有效信号（30秒内）
+        const validSignals = this.pendingSignals.filter(s =>
+            Date.now() - s.timestamp < 30000
+        );
+        return validSignals.length > 0 ? validSignals[validSignals.length - 1] : null;
+    }
+
+    clearPendingSignals() {
+        this.pendingSignals = [];
+    }
+
+    // ========== 导出数据 ==========
+    exportData() {
+        return {
+            exportTime: new Date().toISOString(),
+            stats: this.stats,
+            spikeEvents: this.spikeEvents,
+            currentWhales: {
+                asks: Array.from(this.whaleOrders.values()).filter(o => o.side === 'ask'),
+                bids: Array.from(this.whaleOrders.values()).filter(o => o.side === 'bid')
+            },
+            logs: this.logs.slice(-1000)
+        };
+    }
+
+    getStatus() {
+        return {
+            alertLevel: this.alertLevel,
+            metrics: { ...this.metrics },
+            stats: { ...this.stats },
+            pendingSignals: this.pendingSignals.length
+        };
+    }
+}
+
+// ==================== 主交易系统 ====================
 class BTCAutoTrading {
     // ========== 基础交易配置 ==========
     static TRADING_CONFIG = {
@@ -24,7 +633,7 @@ class BTCAutoTrading {
         TOTAL_ORDERS: 10,              // 总订单数（剥头皮用更少）
 
         // 窗口宽度（核心参数）
-        WINDOW_PERCENT: 0.005,         // 0.5% 窗口范围（剥头皮，约 ±$475）
+        WINDOW_PERCENT: 0.003,         // 0.3% 窗口范围（约 ±$280）
 
         // 买卖单比例（总和必须为1）
         SELL_RATIO: 0.5,
@@ -39,11 +648,11 @@ class BTCAutoTrading {
         MIN_VALID_PRICE: 10000,
         MAX_MULTIPLIER: 15,
 
-        // 策略配置（RSI/ADX 风控）
+        // 策略配置（RSI/ATR 风控）
         RSI_MIN: 30,
-        RSI_MAX: 70,
-        ADX_TREND_THRESHOLD: 25,
-        ADX_STRONG_TREND: 30
+        RSI_MAX: 65,                  // 降低上限，更敏感触发风控
+        ADX_TREND_THRESHOLD: 100,     // ATR 趋势阈值（当前 ATR ≈ 85.7）
+        ADX_STRONG_TREND: 150         // ATR 强趋势阈值
     };
 
     // ========== 01交易所页面元素选择器 ==========
@@ -87,6 +696,25 @@ class BTCAutoTrading {
         this.riskTriggeredReason = '';
 
         this.minOrderInterval = BTCAutoTrading.TRADING_CONFIG.MIN_ORDER_INTERVAL;
+
+        // ====== 交易日志系统 ======
+        this.tradingLogs = [];
+        this.sessionStartTime = null;
+        this.totalOrders = 0;
+        this.successfulOrders = 0;
+        this.cancelledOrders = 0;
+
+        // ====== 当前指标 ======
+        this.currentRsi = null;
+        this.currentAtr = null;
+
+        // ====== 大单监控模块 ======
+        this.whaleMonitor = new WhaleMonitor();
+        this.whaleMonitorInterval = null;
+        this.sniperModeEnabled = true;     // 是否启用插针狙击模式
+        this.lastSniperSignal = null;       // 最近的狙击信号
+        this.sniperPosition = null;         // 狙击仓位状态
+        this.isSniperExecuting = false;     // 狙击执行锁，防止并发
     }
 
     // ==================== 准备交易环境 ====================
@@ -318,11 +946,23 @@ class BTCAutoTrading {
         this.isMonitoring = true;
         this.tradingEnabled = true;
         this.cycleCount = 0;
+        this.sessionStartTime = Date.now();
+        this.clearLogs();
 
         console.log('%c========================================', 'color: #4CAF50; font-weight: bold;');
         console.log('%c  01交易所 网格自动交易已启动', 'color: #4CAF50; font-weight: bold; font-size: 16px;');
+        console.log('%c  + 大单监控 & 插针狙击模块 v2.0', 'color: #9C27B0; font-weight: bold;');
         console.log('%c========================================', 'color: #4CAF50; font-weight: bold;');
         console.log('Post Only 模式已启用，节省手续费');
+        console.log(`插针狙击模式: ${this.sniperModeEnabled ? '✅ 已启用' : '❌ 已禁用'}`);
+
+        // 启动大单监控（独立的高频循环）
+        this.startWhaleMonitor();
+
+        // 请求桌面通知权限
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
 
         const executeWithInterval = async () => {
             if (!this.isMonitoring) return;
@@ -346,11 +986,207 @@ class BTCAutoTrading {
         executeWithInterval();
     }
 
+    // ==================== 大单监控启动 ====================
+    startWhaleMonitor() {
+        if (this.whaleMonitorInterval) {
+            clearInterval(this.whaleMonitorInterval);
+        }
+
+        console.log('%c🐋 大单监控已启动 (间隔: 1秒)', 'color: #2196F3;');
+
+        this.whaleMonitorInterval = setInterval(async () => {
+            if (!this.isMonitoring) return;
+
+            try {
+                const result = this.whaleMonitor.tick();
+
+                // 检查是否有狙击信号 - 立即响应！
+                if (this.sniperModeEnabled && result?.hasPendingSignal) {
+                    // 使用锁防止并发执行
+                    if (!this.isSniperExecuting) {
+                        this.isSniperExecuting = true;
+                        try {
+                            await this.handleSniperSignal();
+                        } finally {
+                            this.isSniperExecuting = false;
+                        }
+                    }
+                }
+
+                // 同时管理现有狙击仓位
+                if (this.sniperPosition && !this.isSniperExecuting) {
+                    await this.manageSniperPosition();
+                }
+            } catch (e) {
+                console.warn('大单监控周期出错:', e.message);
+                this.isSniperExecuting = false;
+            }
+        }, WhaleMonitor.CONFIG.checkInterval);
+    }
+
+    stopWhaleMonitor() {
+        if (this.whaleMonitorInterval) {
+            clearInterval(this.whaleMonitorInterval);
+            this.whaleMonitorInterval = null;
+            console.log('%c🐋 大单监控已停止', 'color: #f44336;');
+        }
+    }
+
+    // ==================== 狙击信号处理 ====================
+    async handleSniperSignal() {
+        const signal = this.whaleMonitor.getPendingSignal();
+        if (!signal) return;
+
+        // 避免重复处理同一信号
+        if (this.lastSniperSignal &&
+            this.lastSniperSignal.timestamp === signal.timestamp) {
+            return;
+        }
+
+        this.lastSniperSignal = signal;
+
+        // 如果正在风控冷却，不执行狙击
+        if (this.riskCoolingDown) {
+            console.log('%c狙击信号被风控冷却阻止', 'color: orange;');
+            return;
+        }
+
+        // 如果已有狙击仓位，不再开新仓
+        if (this.sniperPosition) {
+            console.log('%c已有狙击仓位，跳过新信号', 'color: orange;');
+            return;
+        }
+
+        console.log('%c═══════════════════════════════════════════', 'color: #E91E63;');
+        console.log('%c  🎯 执行狙击入场!', 'color: #E91E63; font-weight: bold; font-size: 16px;');
+        console.log('%c═══════════════════════════════════════════', 'color: #E91E63;');
+
+        // 根据信号类型执行下单
+        if (signal.type === 'LONG_AFTER_DOWN' || signal.type === 'V_SHAPE_LONG') {
+            // 做多信号 - 在当前价位下买单
+            const currentPrice = await this.getCurrentPrice();
+            if (currentPrice) {
+                // 计算入场价（可以在信号价位稍下方挂单）
+                const entryPrice = Math.floor(currentPrice - 5);
+
+                console.log(`狙击做多: 入场价 $${entryPrice}`);
+                console.log(`止损: $${signal.stopLoss} | 止盈: $${signal.takeProfit.join('/$')}`);
+
+                // 执行买单
+                const success = await this.orderManager.placeLimitBuy(entryPrice);
+
+                if (success) {
+                    this.sniperPosition = {
+                        type: 'LONG',
+                        entryPrice: entryPrice,
+                        stopLoss: signal.stopLoss,
+                        takeProfit: signal.takeProfit,
+                        trailingStop: signal.trailingStop,
+                        maxHoldTime: signal.maxHoldTime,
+                        openTime: Date.now(),
+                        signal: signal
+                    };
+
+                    this.logTrade('SNIPER_ENTRY', {
+                        signalType: signal.type,
+                        entryPrice: entryPrice,
+                        stopLoss: signal.stopLoss,
+                        takeProfit: signal.takeProfit
+                    });
+
+                    console.log('%c✅ 狙击买单已下', 'color: #4CAF50; font-weight: bold;');
+                } else {
+                    console.log('%c❌ 狙击买单失败', 'color: #f44336;');
+                }
+            }
+        }
+
+        // 清除已处理的信号
+        this.whaleMonitor.clearPendingSignals();
+    }
+
+    // ==================== 狙击仓位管理 ====================
+    async manageSniperPosition() {
+        if (!this.sniperPosition) return;
+
+        const currentPrice = await this.getCurrentPrice();
+        if (!currentPrice) return;
+
+        const pos = this.sniperPosition;
+        const pnl = pos.type === 'LONG'
+            ? currentPrice - pos.entryPrice
+            : pos.entryPrice - currentPrice;
+
+        // 检查止损
+        if (pnl <= -pos.stopLoss) {
+            console.log(`%c❌ 狙击止损触发: $${pnl.toFixed(1)}`, 'color: #F44336; font-weight: bold;');
+            await this.closeSniperPosition('STOP_LOSS', pnl);
+            return;
+        }
+
+        // 检查止盈
+        for (const tp of pos.takeProfit) {
+            if (pnl >= tp) {
+                console.log(`%c✅ 狙击止盈触发: $${tp}`, 'color: #4CAF50; font-weight: bold;');
+                await this.closeSniperPosition('TAKE_PROFIT', pnl);
+                return;
+            }
+        }
+
+        // 检查移动止损
+        if (pos.trailingStop && pnl > pos.trailingStop) {
+            const newStopLoss = pnl - pos.trailingStop;
+            if (newStopLoss > -pos.stopLoss) {
+                pos.stopLoss = -newStopLoss;
+                console.log(`移动止损更新: $${pos.stopLoss.toFixed(1)}`);
+            }
+        }
+
+        // 检查最大持仓时间
+        if (pos.maxHoldTime && Date.now() - pos.openTime > pos.maxHoldTime) {
+            console.log('%c⏱️ 狙击持仓超时，平仓', 'color: #FF9800;');
+            await this.closeSniperPosition('TIMEOUT', pnl);
+        }
+    }
+
+    async closeSniperPosition(reason, pnl) {
+        console.log(`狙击平仓: ${reason}, PnL: $${pnl.toFixed(1)}`);
+
+        this.logTrade('SNIPER_EXIT', {
+            reason: reason,
+            pnl: pnl,
+            position: { ...this.sniperPosition }
+        });
+
+        // 这里可以添加实际的平仓逻辑
+        // 简化处理：只清除状态，实际平仓依赖手动或其他机制
+        this.sniperPosition = null;
+    }
+
+    // ==================== 狙击模式开关 ====================
+    enableSniperMode() {
+        this.sniperModeEnabled = true;
+        console.log('%c🎯 插针狙击模式已启用', 'color: #4CAF50; font-weight: bold;');
+    }
+
+    disableSniperMode() {
+        this.sniperModeEnabled = false;
+        console.log('%c🎯 插针狙击模式已禁用', 'color: #f44336;');
+    }
+
     stopAutoTrading() {
         this.isMonitoring = false;
         this.tradingEnabled = false;
         clearInterval(this.monitorInterval);
         this.monitorInterval = null;
+
+        // 停止大单监控
+        this.stopWhaleMonitor();
+
+        // 导出大单监控数据
+        const whaleData = this.whaleMonitor.exportData();
+        console.log('%c大单监控数据:', 'color: #2196F3;', whaleData.stats);
+
         console.log('%c自动交易已停止', 'color: red; font-weight: bold;');
     }
 
@@ -358,13 +1194,40 @@ class BTCAutoTrading {
     async executeTradingCycle() {
         if (!this.tradingEnabled) return;
         this.cycleCount++;
-        console.log(`\n[${new Date().toLocaleTimeString()}] 第${this.cycleCount}次循环`);
+
+        // 获取大单监控状态
+        const whaleStatus = this.whaleMonitor.getStatus();
+        const alertEmoji = {
+            'GREEN': '🟢',
+            'YELLOW': '🟡',
+            'ORANGE': '🟠',
+            'RED': '🔴'
+        }[whaleStatus.alertLevel] || '⚪';
+
+        console.log(`\n[${new Date().toLocaleTimeString()}] 第${this.cycleCount}次循环 ${alertEmoji} ${whaleStatus.alertLevel}`);
 
         // 1. 检查风控冷却状态
         if (this.checkRiskCooldown()) {
             await this.cancelAllOrders();
             return;
         }
+
+        // 1.5. 检查大单监控红色警报 - 暂停网格下单
+        if (whaleStatus.alertLevel === 'RED') {
+            console.log('%c⚠️ 红色警报：检测到即将插针，暂停网格下单', 'color: #F44336; font-weight: bold;');
+            // 不取消订单，但暂停新下单，让狙击模块接管
+            // 管理狙击仓位
+            await this.manageSniperPosition();
+            return;
+        }
+
+        // 1.6. 橙色警报时减少下单
+        if (whaleStatus.alertLevel === 'ORANGE') {
+            console.log('%c⚠️ 橙色警报：高风险状态，谨慎下单', 'color: #FF9800;');
+        }
+
+        // 管理狙击仓位（如果有）
+        await this.manageSniperPosition();
 
         // 2. RSI/ADX 检查（如果有 TradingView iframe）
         try {
@@ -374,12 +1237,16 @@ class BTCAutoTrading {
                 const { rsi, adx } = indicators;
                 const { RSI_MIN, RSI_MAX, ADX_TREND_THRESHOLD, ADX_STRONG_TREND } = BTCAutoTrading.GRID_STRATEGY_CONFIG;
 
-                console.log(`%c当前指标 - RSI: ${rsi.toFixed(2)}, ADX: ${adx.toFixed(2)}`,
+                // 保存当前指标（供趋势过滤使用）
+                this.currentRsi = rsi;
+                this.currentAtr = adx;
+
+                console.log(`%c当前指标 - RSI: ${rsi.toFixed(2)}, ATR: ${adx.toFixed(2)}`,
                     "color: #ff9800; font-weight: bold;");
 
                 // 强趋势触发风控
                 if (adx > ADX_STRONG_TREND) {
-                    const reason = `强趋势市场 (ADX: ${adx.toFixed(2)} > ${ADX_STRONG_TREND})`;
+                    const reason = `强趋势市场 (ATR: ${adx.toFixed(2)} > ${ADX_STRONG_TREND})`;
                     console.log(`%c[风控触发] ${reason}`, "color: red; font-weight: bold;");
                     this.triggerRiskCooldown(reason);
                     return;
@@ -665,6 +1532,28 @@ class BTCAutoTrading {
         if (!isAtLimit) {
             finalBuyRatio = Math.max(0.1, Math.min(0.9, finalBuyRatio));
             finalSellRatio = Math.max(0.1, Math.min(0.9, finalSellRatio));
+
+            // ====== 方案 B：RSI 趋势过滤 ======
+            // 根据 RSI 动态调整买卖比例
+            if (this.currentRsi !== null) {
+                const rsi = this.currentRsi;
+
+                if (rsi > 55) {
+                    // 上涨趋势：减少卖单比例，避免在上涨中开空单
+                    const adjustFactor = Math.min((rsi - 55) / 30, 0.5);  // 最多减少 50%
+                    finalSellRatio = Math.max(0.1, finalSellRatio * (1 - adjustFactor));
+                    finalBuyRatio = 1 - finalSellRatio;
+                    console.log(`%c[趋势过滤] RSI ${rsi.toFixed(1)} 偏高，卖单比例降至 ${(finalSellRatio * 100).toFixed(0)}%`,
+                        "color: #2196F3;");
+                } else if (rsi < 45) {
+                    // 下跌趋势：减少买单比例，避免在下跌中开多单
+                    const adjustFactor = Math.min((45 - rsi) / 30, 0.5);  // 最多减少 50%
+                    finalBuyRatio = Math.max(0.1, finalBuyRatio * (1 - adjustFactor));
+                    finalSellRatio = 1 - finalBuyRatio;
+                    console.log(`%c[趋势过滤] RSI ${rsi.toFixed(1)} 偏低，买单比例降至 ${(finalBuyRatio * 100).toFixed(0)}%`,
+                        "color: #2196F3;");
+                }
+            }
         }
 
         const sellCount = Math.round(cfg.TOTAL_ORDERS * finalSellRatio);
@@ -750,6 +1639,9 @@ class BTCAutoTrading {
                 ? await this.orderManager.placeLimitBuy(order.price)
                 : await this.orderManager.placeLimitSell(order.price);
 
+            // 记录下单日志
+            this.logOrderPlaced(order.type, order.price, success);
+
             if (success) {
                 this.lastOrderTime = Date.now();
                 await this.delay(BTCAutoTrading.TRADING_CONFIG.ORDER_COOLDOWN);
@@ -816,7 +1708,7 @@ class BTCAutoTrading {
         console.log('平仓操作完成');
     }
 
-    // ==================== RSI 读取模块 ====================
+    // ==================== RSI/ATR 读取模块 ====================
     async getIndicatorsFromChart() {
         const iframe = document.querySelector('iframe');
         if (!iframe) return null;
@@ -826,27 +1718,20 @@ class BTCAutoTrading {
             if (!doc) return null;
 
             const valueElements = doc.querySelectorAll('div[class*="valueValue"]');
-            if (valueElements.length === 0) return null;
+            if (valueElements.length < 14) return null;
 
-            let result = { rsi: null, adx: null };
+            // 根据实际测试，索引 13 是 RSI，索引 15 是 ATR
+            const rsiText = valueElements[13]?.textContent?.trim();
+            const atrText = valueElements[15]?.textContent?.trim();
 
-            valueElements.forEach(element => {
-                const valueText = element.textContent.trim();
-                const color = window.getComputedStyle(element).color;
-                const parent = element.parentElement;
-                const titleEl = parent?.querySelector('div[class*="valueTitle"]');
-                const title = titleEl ? titleEl.textContent.trim() : '';
+            const rsi = parseFloat(rsiText?.replace(/,/g, ''));
+            const atr = parseFloat(atrText?.replace(/,/g, ''));
 
-                const val = parseFloat(valueText.replace(/,/g, ''));
-
-                if (color.includes('126, 87, 194') || title === 'RSI') {
-                    result.rsi = val;
-                } else if (color.includes('255, 82, 82') || title === 'ADX') {
-                    result.adx = val;
-                }
-            });
-
-            return result;
+            // 返回结果（用 atr 替代 adx）
+            return {
+                rsi: isNaN(rsi) ? null : rsi,
+                adx: isNaN(atr) ? null : atr  // 用 ATR 替代 ADX 作为趋势指标
+            };
         } catch (e) {
             return null;
         }
@@ -862,12 +1747,28 @@ class BTCAutoTrading {
 
     getStatus() {
         const riskStatus = this.getRiskCooldownStatus();
+        const whaleStatus = this.whaleMonitor.getStatus();
         return {
             isMonitoring: this.isMonitoring,
             cycleCount: this.cycleCount,
             processedCount: this.processedOrders.size,
             lastOrderTime: this.lastOrderTime ? new Date(this.lastOrderTime).toLocaleTimeString() : '无',
-            riskCooldown: riskStatus
+            riskCooldown: riskStatus,
+            // 大单监控状态
+            whaleMonitor: {
+                alertLevel: whaleStatus.alertLevel,
+                vacuum: whaleStatus.metrics.vacuumDetected,
+                removalVelocity: whaleStatus.metrics.removalVelocity.toFixed(2) + '/秒',
+                imbalance: (whaleStatus.metrics.imbalanceRatio * 100).toFixed(1) + '%',
+                stats: whaleStatus.stats
+            },
+            // 狙击状态
+            sniperMode: this.sniperModeEnabled,
+            sniperPosition: this.sniperPosition ? {
+                type: this.sniperPosition.type,
+                entryPrice: this.sniperPosition.entryPrice,
+                holdTime: Math.floor((Date.now() - this.sniperPosition.openTime) / 1000) + '秒'
+            } : null
         };
     }
 
@@ -877,6 +1778,172 @@ class BTCAutoTrading {
 
     delay(ms) {
         return new Promise(r => setTimeout(r, ms));
+    }
+
+    // ==================== 交易日志系统 ====================
+    logTrade(action, data) {
+        const log = {
+            timestamp: new Date().toISOString(),
+            time: new Date().toLocaleTimeString(),
+            action: action,
+            ...data
+        };
+        this.tradingLogs.push(log);
+        if (this.tradingLogs.length > 1000) {
+            this.tradingLogs = this.tradingLogs.slice(-1000);
+        }
+    }
+
+    logOrderPlaced(type, price, success) {
+        this.totalOrders++;
+        if (success) this.successfulOrders++;
+        this.logTrade('ORDER_PLACED', {
+            type: type,
+            price: price,
+            success: success,
+            marketPrice: this.getBidAskPrices()
+        });
+    }
+
+    logOrderCancelled(price) {
+        this.cancelledOrders++;
+        this.logTrade('ORDER_CANCELLED', { price: price });
+    }
+
+    getLogsSummary() {
+        const duration = this.sessionStartTime
+            ? Math.floor((Date.now() - this.sessionStartTime) / 60000)
+            : 0;
+        return {
+            sessionDuration: `${duration} 分钟`,
+            totalCycles: this.cycleCount,
+            totalOrders: this.totalOrders,
+            successfulOrders: this.successfulOrders,
+            cancelledOrders: this.cancelledOrders,
+            successRate: this.totalOrders > 0
+                ? `${(this.successfulOrders / this.totalOrders * 100).toFixed(1)}%`
+                : 'N/A',
+            logsCount: this.tradingLogs.length
+        };
+    }
+
+    exportLogs() {
+        const data = {
+            exportTime: new Date().toISOString(),
+            config: BTCAutoTrading.GRID_STRATEGY_CONFIG,
+            summary: this.getLogsSummary(),
+            logs: this.tradingLogs
+        };
+        const jsonStr = JSON.stringify(data, null, 2);
+        console.log('%c========== 交易日志导出 ==========', 'color: #4CAF50; font-weight: bold;');
+        console.log(jsonStr);
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(jsonStr).then(() => {
+                console.log('%c✅ 日志已复制到剪贴板！', 'color: green;');
+            });
+        }
+        return data;
+    }
+
+    // ==================== 完整日志导出（供AI分析优化）====================
+    exportFullReport() {
+        const whaleData = this.whaleMonitor.exportData();
+        const tradingSummary = this.getLogsSummary();
+        const riskStatus = this.getRiskCooldownStatus();
+
+        const fullReport = {
+            // 元信息
+            meta: {
+                exportTime: new Date().toISOString(),
+                scriptVersion: '2.0',
+                sessionStartTime: this.sessionStartTime ? new Date(this.sessionStartTime).toISOString() : null,
+                sessionDuration: tradingSummary.sessionDuration,
+            },
+
+            // 配置快照
+            config: {
+                trading: BTCAutoTrading.TRADING_CONFIG,
+                grid: BTCAutoTrading.GRID_STRATEGY_CONFIG,
+                whaleMonitor: WhaleMonitor.CONFIG,
+                sniperStrategy: WhaleMonitor.SNIPER_CONFIG,
+            },
+
+            // 交易统计
+            tradingStats: {
+                ...tradingSummary,
+                riskCooldownTriggered: riskStatus.inCooldown,
+                riskReason: riskStatus.reason || null,
+            },
+
+            // 大单监控统计
+            whaleStats: whaleData.stats,
+
+            // 插针事件（关键数据）
+            spikeEvents: whaleData.spikeEvents,
+
+            // 狙击交易记录
+            sniperTrades: this.tradingLogs.filter(log =>
+                log.action === 'SNIPER_ENTRY' || log.action === 'SNIPER_EXIT'
+            ),
+
+            // 当前大单快照
+            currentWhales: whaleData.currentWhales,
+
+            // 完整交易日志
+            tradingLogs: this.tradingLogs,
+
+            // 大单变化日志（最近500条）
+            whaleLogs: whaleData.logs.slice(-500),
+
+            // 分析建议提示
+            analysisHints: {
+                questions: [
+                    '插针事件的时间间隔和幅度是否有规律？',
+                    '大单出现/消失与插针的时间关系如何？',
+                    '狙击信号的准确率如何？是否有误触发？',
+                    '网格订单在插针前后的表现如何？',
+                    '风控触发是否合理？阈值需要调整吗？',
+                    '哪些参数需要优化？给出具体建议值。',
+                ],
+                dataPoints: {
+                    totalSpikes: whaleData.stats.upSpikes + whaleData.stats.downSpikes,
+                    sniperSignals: whaleData.stats.signalsGenerated,
+                    whaleOrderTurnover: `${whaleData.stats.totalNewOrders} 新增 / ${whaleData.stats.totalRemovedOrders} 撤销`,
+                    gridOrders: `${tradingSummary.successfulOrders}/${tradingSummary.totalOrders} 成功`,
+                }
+            }
+        };
+
+        // 导出为JSON文件
+        const jsonStr = JSON.stringify(fullReport, null, 2);
+        const blob = new Blob([jsonStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `01grid_full_report_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        console.log('%c═══════════════════════════════════════════', 'color: #9C27B0;');
+        console.log('%c  📊 完整报告已导出', 'color: #9C27B0; font-weight: bold; font-size: 16px;');
+        console.log('%c═══════════════════════════════════════════', 'color: #9C27B0;');
+        console.log('包含内容:');
+        console.log(`  - 插针事件: ${fullReport.spikeEvents.length} 次`);
+        console.log(`  - 狙击交易: ${fullReport.sniperTrades.length} 次`);
+        console.log(`  - 交易日志: ${fullReport.tradingLogs.length} 条`);
+        console.log(`  - 大单日志: ${fullReport.whaleLogs.length} 条`);
+        console.log('');
+        console.log('%c使用方法: 将导出的JSON文件发给AI进行分析优化', 'color: #607D8B;');
+
+        return fullReport;
+    }
+
+    clearLogs() {
+        this.tradingLogs = [];
+        this.totalOrders = 0;
+        this.successfulOrders = 0;
+        this.cancelledOrders = 0;
+        console.log('交易日志已清空');
     }
 }
 
@@ -1318,22 +2385,436 @@ class OrderManager01 {
     }
 }
 
+// ==================== 持仓止盈止损管理器 ====================
+class PositionStopLossManager {
+    static CONFIG = {
+        checkInterval: 5000,          // 检查间隔 5秒
+        takeProfitPercent: 1.0,       // 止盈百分比 1%
+        stopLossPercent: 1.0,         // 止损百分比 1%
+        priceBuffer: 0.5,             // 价格缓冲区（避免频繁更新）
+    };
+
+    constructor(orderManager) {
+        this.orderManager = orderManager;
+        this.isRunning = false;
+        this.checkInterval = null;
+
+        // 当前止盈止损单状态
+        this.currentTPOrder = null;   // 止盈挂单
+        this.currentSLOrder = null;   // 止损挂单
+
+        // 上次检测到的持仓
+        this.lastPosition = null;
+        this.lastEntryPrice = null;
+
+        // 日志
+        this.logs = [];
+    }
+
+    // ========== 读取当前持仓信息 ==========
+    getPositionInfo() {
+        try {
+            // 从 Positions 表格读取数据
+            // 根据截图，表格结构：Market | Position | Position Value | Entry Price | Mark Price | ...
+            const tables = document.querySelectorAll('table');
+
+            for (const table of tables) {
+                const tbody = table.querySelector('tbody');
+                if (!tbody) continue;
+
+                const rows = tbody.querySelectorAll('tr');
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length < 5) continue;
+
+                    // 检查是否是 BTC 仓位行
+                    const marketCell = cells[0]?.textContent?.trim() || '';
+                    if (!marketCell.includes('BTC')) continue;
+
+                    // 读取 Position (第2列)
+                    const positionText = cells[1]?.textContent?.trim() || '';
+                    const position = parseFloat(positionText.replace(/[^0-9.-]/g, ''));
+
+                    // 读取 Entry Price (第4列)
+                    const entryPriceText = cells[3]?.textContent?.trim() || '';
+                    const entryPrice = parseFloat(entryPriceText.replace(/[$,]/g, ''));
+
+                    // 读取 Mark Price (第5列)
+                    const markPriceText = cells[4]?.textContent?.trim() || '';
+                    const markPrice = parseFloat(markPriceText.replace(/[$,]/g, ''));
+
+                    if (position && entryPrice) {
+                        return {
+                            market: marketCell,
+                            position: position,           // 正数=多仓，负数=空仓
+                            entryPrice: entryPrice,
+                            markPrice: markPrice || entryPrice,
+                            isLong: position > 0,
+                            isShort: position < 0,
+                            size: Math.abs(position)
+                        };
+                    }
+                }
+            }
+
+            // 备用方法：通过 Close Position 按钮附近的元素读取
+            const closeBtn = Array.from(document.querySelectorAll('button'))
+                .find(btn => btn.textContent.includes('Close Position'));
+
+            if (closeBtn) {
+                const row = closeBtn.closest('tr');
+                if (row) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length >= 5) {
+                        const positionText = cells[1]?.textContent?.trim() || '';
+                        const position = parseFloat(positionText.replace(/[^0-9.-]/g, ''));
+                        const entryPriceText = cells[3]?.textContent?.trim() || '';
+                        const entryPrice = parseFloat(entryPriceText.replace(/[$,]/g, ''));
+
+                        if (position && entryPrice) {
+                            return {
+                                market: 'BTC/USD',
+                                position: position,
+                                entryPrice: entryPrice,
+                                isLong: position > 0,
+                                isShort: position < 0,
+                                size: Math.abs(position)
+                            };
+                        }
+                    }
+                }
+            }
+
+            return null;
+        } catch (e) {
+            console.warn('读取持仓信息失败:', e.message);
+            return null;
+        }
+    }
+
+    // ========== 计算止盈止损价格 ==========
+    calculateTPSLPrices(entryPrice, isLong) {
+        const tpPercent = PositionStopLossManager.CONFIG.takeProfitPercent / 100;
+        const slPercent = PositionStopLossManager.CONFIG.stopLossPercent / 100;
+
+        if (isLong) {
+            // 多仓：止盈在上方，止损在下方
+            return {
+                takeProfit: Math.round(entryPrice * (1 + tpPercent) * 10) / 10,
+                stopLoss: Math.round(entryPrice * (1 - slPercent) * 10) / 10
+            };
+        } else {
+            // 空仓：止盈在下方，止损在上方
+            return {
+                takeProfit: Math.round(entryPrice * (1 - tpPercent) * 10) / 10,
+                stopLoss: Math.round(entryPrice * (1 + slPercent) * 10) / 10
+            };
+        }
+    }
+
+    // ========== 启动止盈止损监控 ==========
+    start() {
+        if (this.isRunning) {
+            console.log('止盈止损监控已在运行');
+            return;
+        }
+
+        this.isRunning = true;
+        console.log('%c═══════════════════════════════════════════', 'color: #FF5722;');
+        console.log('%c  📊 持仓止盈止损监控已启动', 'color: #FF5722; font-weight: bold; font-size: 14px;');
+        console.log('%c═══════════════════════════════════════════', 'color: #FF5722;');
+        console.log(`止盈: ±${PositionStopLossManager.CONFIG.takeProfitPercent}%`);
+        console.log(`止损: ±${PositionStopLossManager.CONFIG.stopLossPercent}%`);
+        console.log(`检查间隔: ${PositionStopLossManager.CONFIG.checkInterval / 1000}秒`);
+
+        // 立即执行一次
+        this.checkAndUpdateOrders();
+
+        // 设置定时检查
+        this.checkInterval = setInterval(() => {
+            this.checkAndUpdateOrders();
+        }, PositionStopLossManager.CONFIG.checkInterval);
+    }
+
+    // ========== 停止监控 ==========
+    stop() {
+        if (!this.isRunning) return;
+
+        this.isRunning = false;
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+            this.checkInterval = null;
+        }
+
+        console.log('%c📊 持仓止盈止损监控已停止', 'color: #f44336; font-weight: bold;');
+    }
+
+    // ========== 核心检查和更新逻辑 ==========
+    async checkAndUpdateOrders() {
+        if (!this.isRunning) return;
+
+        try {
+            const position = this.getPositionInfo();
+
+            // 无持仓时清理
+            if (!position || position.size === 0) {
+                if (this.currentTPOrder || this.currentSLOrder) {
+                    console.log('%c无持仓，清理止盈止损单状态', 'color: #9E9E9E;');
+                    this.currentTPOrder = null;
+                    this.currentSLOrder = null;
+                    this.lastPosition = null;
+                    this.lastEntryPrice = null;
+                }
+                return;
+            }
+
+            // 计算止盈止损价格
+            const prices = this.calculateTPSLPrices(position.entryPrice, position.isLong);
+
+            // 检查是否需要更新
+            const needUpdate = this.shouldUpdateOrders(position, prices);
+
+            if (needUpdate) {
+                console.log('%c═══════════════════════════════════════════', 'color: #FF5722;');
+                console.log('%c  🔄 更新止盈止损挂单', 'color: #FF5722; font-weight: bold;');
+                console.log('%c═══════════════════════════════════════════', 'color: #FF5722;');
+                console.log(`持仓: ${position.position} BTC (${position.isLong ? '多' : '空'})`);
+                console.log(`入场价: $${position.entryPrice.toFixed(1)}`);
+                console.log(`止盈价: $${prices.takeProfit.toFixed(1)} (${position.isLong ? '+' : '-'}${PositionStopLossManager.CONFIG.takeProfitPercent}%)`);
+                console.log(`止损价: $${prices.stopLoss.toFixed(1)} (${position.isLong ? '-' : '+'}${PositionStopLossManager.CONFIG.stopLossPercent}%)`);
+
+                await this.placeTPSLOrders(position, prices);
+
+                // 更新状态
+                this.lastPosition = position.position;
+                this.lastEntryPrice = position.entryPrice;
+                this.currentTPOrder = { price: prices.takeProfit, side: position.isLong ? 'sell' : 'buy' };
+                this.currentSLOrder = { price: prices.stopLoss, side: position.isLong ? 'sell' : 'buy' };
+
+                this.log('TPSL_UPDATED', {
+                    position: position,
+                    takeProfit: prices.takeProfit,
+                    stopLoss: prices.stopLoss
+                });
+            }
+
+        } catch (e) {
+            console.warn('止盈止损检查出错:', e.message);
+        }
+    }
+
+    // ========== 判断是否需要更新挂单 ==========
+    shouldUpdateOrders(position, prices) {
+        // 情况1: 首次设置
+        if (!this.currentTPOrder || !this.currentSLOrder) {
+            return true;
+        }
+
+        // 情况2: 持仓方向变化
+        if (this.lastPosition &&
+            ((this.lastPosition > 0 && position.position < 0) ||
+             (this.lastPosition < 0 && position.position > 0))) {
+            console.log('持仓方向变化，需要更新止盈止损');
+            return true;
+        }
+
+        // 情况3: 入场价变化超过缓冲区
+        const buffer = PositionStopLossManager.CONFIG.priceBuffer;
+        if (this.lastEntryPrice &&
+            Math.abs(position.entryPrice - this.lastEntryPrice) > buffer) {
+            console.log(`入场价变化: $${this.lastEntryPrice} → $${position.entryPrice}`);
+            return true;
+        }
+
+        // 情况4: 止盈止损价格变化较大
+        if (Math.abs(prices.takeProfit - this.currentTPOrder.price) > buffer ||
+            Math.abs(prices.stopLoss - this.currentSLOrder.price) > buffer) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ========== 下止盈止损单 ==========
+    async placeTPSLOrders(position, prices) {
+        try {
+            // 止盈止损单需要使用 Reduce-Only 模式
+            // 多仓：止盈卖出(价高)，止损卖出(价低)
+            // 空仓：止盈买入(价低)，止损买入(价高)
+
+            const closeSide = position.isLong ? 'sell' : 'buy';
+
+            // 确保启用 Reduce-Only
+            await this.ensureReduceOnly();
+
+            // 下止盈单
+            console.log(`下止盈单: ${closeSide.toUpperCase()} @ $${prices.takeProfit}`);
+            if (closeSide === 'sell') {
+                await this.orderManager.placeLimitSell(prices.takeProfit);
+            } else {
+                await this.orderManager.placeLimitBuy(prices.takeProfit);
+            }
+
+            await this.delay(1000);
+
+            // 下止损单
+            console.log(`下止损单: ${closeSide.toUpperCase()} @ $${prices.stopLoss}`);
+            if (closeSide === 'sell') {
+                await this.orderManager.placeLimitSell(prices.stopLoss);
+            } else {
+                await this.orderManager.placeLimitBuy(prices.stopLoss);
+            }
+
+            // 关闭 Reduce-Only
+            await this.disableReduceOnly();
+
+            console.log('%c✅ 止盈止损单已更新', 'color: #4CAF50; font-weight: bold;');
+
+        } catch (e) {
+            console.error('下止盈止损单失败:', e.message);
+        }
+    }
+
+    // ========== Reduce-Only 控制 ==========
+    async ensureReduceOnly() {
+        const reduceOnlyBtns = document.querySelectorAll('button#reduce-only');
+
+        for (const btn of reduceOnlyBtns) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+
+            const isChecked = btn.getAttribute('data-state') === 'checked' ||
+                btn.getAttribute('aria-checked') === 'true';
+
+            if (!isChecked) {
+                btn.click();
+                console.log('已启用 Reduce-Only');
+                await this.delay(300);
+            }
+        }
+    }
+
+    async disableReduceOnly() {
+        const reduceOnlyBtns = document.querySelectorAll('button#reduce-only');
+
+        for (const btn of reduceOnlyBtns) {
+            const rect = btn.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+
+            const isChecked = btn.getAttribute('data-state') === 'checked' ||
+                btn.getAttribute('aria-checked') === 'true';
+
+            if (isChecked) {
+                btn.click();
+                console.log('已关闭 Reduce-Only');
+                await this.delay(300);
+            }
+        }
+    }
+
+    // ========== 手动设置止盈止损百分比 ==========
+    setTPPercent(percent) {
+        PositionStopLossManager.CONFIG.takeProfitPercent = percent;
+        console.log(`止盈百分比已设置为: ${percent}%`);
+        this.currentTPOrder = null; // 强制下次更新
+    }
+
+    setSLPercent(percent) {
+        PositionStopLossManager.CONFIG.stopLossPercent = percent;
+        console.log(`止损百分比已设置为: ${percent}%`);
+        this.currentSLOrder = null; // 强制下次更新
+    }
+
+    setTPSLPercent(tpPercent, slPercent) {
+        PositionStopLossManager.CONFIG.takeProfitPercent = tpPercent;
+        PositionStopLossManager.CONFIG.stopLossPercent = slPercent;
+        console.log(`止盈止损已设置: TP=${tpPercent}%, SL=${slPercent}%`);
+        this.currentTPOrder = null;
+        this.currentSLOrder = null;
+    }
+
+    // ========== 状态查询 ==========
+    getStatus() {
+        const position = this.getPositionInfo();
+        return {
+            isRunning: this.isRunning,
+            config: {
+                takeProfitPercent: PositionStopLossManager.CONFIG.takeProfitPercent,
+                stopLossPercent: PositionStopLossManager.CONFIG.stopLossPercent,
+                checkInterval: PositionStopLossManager.CONFIG.checkInterval
+            },
+            currentPosition: position,
+            currentTPOrder: this.currentTPOrder,
+            currentSLOrder: this.currentSLOrder,
+            lastUpdate: this.logs.length > 0 ? this.logs[this.logs.length - 1].timestamp : null
+        };
+    }
+
+    // ========== 日志 ==========
+    log(action, data) {
+        this.logs.push({
+            timestamp: new Date().toISOString(),
+            action,
+            ...data
+        });
+        if (this.logs.length > 500) this.logs = this.logs.slice(-500);
+    }
+
+    delay(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+}
+
 // ==================== 全局实例 ====================
 const autoTrader = new BTCAutoTrading();
+const tpslManager = new PositionStopLossManager(autoTrader.orderManager);
 
 // ==================== 快捷指令 ====================
-console.log('%c========================================', 'color: #2196F3;');
-console.log('%c  01交易所网格交易脚本已加载', 'color: #2196F3; font-weight: bold;');
-console.log('%c========================================', 'color: #2196F3;');
-console.log('可用命令:');
+console.log('%c═══════════════════════════════════════════════════════', 'color: #2196F3;');
+console.log('%c  01交易所 网格交易 + 插针狙击 v2.0', 'color: #2196F3; font-weight: bold; font-size: 16px;');
+console.log('%c═══════════════════════════════════════════════════════', 'color: #2196F3;');
+console.log('');
+console.log('%c基础命令:', 'color: #4CAF50; font-weight: bold;');
 console.log('  autoTrader.startAutoTrading()  - 启动自动交易');
 console.log('  autoTrader.stopAutoTrading()   - 停止自动交易');
-console.log('  autoTrader.getStatus()         - 查看状态');
+console.log('  autoTrader.getStatus()         - 查看完整状态');
 console.log('  autoTrader.cancelAllOrders()   - 取消所有订单');
 console.log('  autoTrader.resetRiskCooldown() - 重置风控冷却');
 console.log('');
-console.log('请先在页面上设置好 Size（开仓数量），然后运行:');
-console.log('  autoTrader.startAutoTrading()');
+console.log('%c插针狙击命令:', 'color: #9C27B0; font-weight: bold;');
+console.log('  autoTrader.enableSniperMode()  - 启用狙击模式');
+console.log('  autoTrader.disableSniperMode() - 禁用狙击模式');
+console.log('  autoTrader.whaleMonitor.getStatus()   - 查看大单监控状态');
+console.log('');
+console.log('%c止盈止损命令:', 'color: #FF5722; font-weight: bold;');
+console.log('  tpslManager.start()            - 启动止盈止损监控');
+console.log('  tpslManager.stop()             - 停止止盈止损监控');
+console.log('  tpslManager.getStatus()        - 查看止盈止损状态');
+console.log('  tpslManager.setTPSLPercent(1, 1) - 设置止盈止损百分比');
+console.log('  tpslManager.getPositionInfo()  - 查看当前持仓信息');
+console.log('');
+console.log('%c日志导出命令:', 'color: #E91E63; font-weight: bold;');
+console.log('  autoTrader.exportFullReport()  - 导出完整报告(供AI分析)');
+console.log('  autoTrader.exportLogs()        - 导出交易日志');
+console.log('  autoTrader.whaleMonitor.exportData()  - 导出大单数据');
+console.log('');
+console.log('%c警报级别说明:', 'color: #FF9800; font-weight: bold;');
+console.log('  🟢 GREEN  - 市场正常，正常网格交易');
+console.log('  🟡 YELLOW - 注意观察，可能有波动');
+console.log('  🟠 ORANGE - 高风险，谨慎下单');
+console.log('  🔴 RED    - 即将插针！暂停网格，等待狙击信号');
+console.log('');
+console.log('%c使用说明:', 'color: #607D8B;');
+console.log('  1. 先在页面上设置好 Size（开仓数量）');
+console.log('  2. 运行 autoTrader.startAutoTrading()');
+console.log('  3. 系统会自动监控大单和插针');
+console.log('  4. DOWN_SPIKE 时自动生成做多信号');
+console.log('');
+
+// 请求桌面通知权限
+if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+}
 
 // 自动启动（可选，取消注释以自动启动）
 // autoTrader.startAutoTrading();
