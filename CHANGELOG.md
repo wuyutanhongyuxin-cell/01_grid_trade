@@ -1,5 +1,71 @@
 # 更新日志 / Changelog
 
+## v2.5 (2026-01-21) - 01_grid_v2.5_adx_sniper_fix.js
+
+### 新增功能
+
+#### 1. ADX 指标风控
+从 TradingView 图表读取 ADX 指标（索引16），配合 RSI 和 ATR 构成三重风控：
+
+| 指标 | 阈值 | 说明 |
+|------|------|------|
+| ATR | > 150 | 高波动市场，触发风控 |
+| ADX | > 25 | 趋势确认阈值 |
+| ADX | > 30 | 强趋势，配合 RSI 超限触发风控 |
+| RSI | < 30 或 > 70 | 超卖/超买 |
+
+#### 2. 修复狙击与风控冲突
+
+**问题**：插针发生时 ATR/RSI 容易超限，触发风控后会阻止狙击入场。
+
+**解决方案**：区分风控来源
+
+| 风控来源 | 阻止网格 | 阻止狙击 |
+|---------|---------|---------|
+| `INDICATOR` (图表指标) | ✅ | ❌ |
+| `WHALE` (大单监控) | ✅ | ✅ |
+
+现在图表指标风控时，狙击仍可正常执行插针入场。
+
+#### 3. 之前版本功能汇总 (v2.2-v2.4)
+
+- **v2.4**: 日志持久化管理器 (LogPersistenceManager)
+- **v2.3**: 修复止盈止损单 Post-Only 被拒绝问题
+- **v2.2**: 保证金保护管理器 (MarginProtectionManager)
+
+### 使用方法
+
+```javascript
+// 推荐启动顺序
+logManager.start()              // 1. 启用日志持久化
+autoTrader.startAutoTrading()   // 2. 启动网格+狙击
+tpslManager.start()             // 3. 启动止盈止损（可选）
+marginProtector.start()         // 4. 启动保证金保护（可选）
+
+// 快速一键启动
+logManager.start(); autoTrader.startAutoTrading(); tpslManager.start();
+```
+
+### 完整命令列表
+
+| 命令 | 说明 |
+|------|------|
+| `autoTrader.startAutoTrading()` | 启动自动交易 |
+| `autoTrader.stopAutoTrading()` | 停止自动交易 |
+| `autoTrader.getStatus()` | 查看当前状态 |
+| `autoTrader.resetRiskCooldown()` | 重置风控冷却 |
+| `autoTrader.enableSniperMode()` | 启用狙击模式 |
+| `autoTrader.disableSniperMode()` | 禁用狙击模式 |
+| `tpslManager.start()` | 启动止盈止损 |
+| `tpslManager.stop()` | 停止止盈止损 |
+| `marginProtector.start()` | 启动保证金保护 |
+| `marginProtector.stop()` | 停止保证金保护 |
+| `logManager.start()` | 启动日志持久化 |
+| `logManager.restoreLogs()` | 恢复上次日志 |
+| `autoTrader.exportFullReport()` | 导出完整报告 |
+
+---
+
 ## v2.1 优化版 (2026-01-20) - 01_grid_v2.1_optimized.js
 
 基于 298 分钟实盘运行数据分析后的优化版本。
